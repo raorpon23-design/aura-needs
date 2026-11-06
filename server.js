@@ -340,6 +340,29 @@ function buildHistory(chat, ai) {
   return items;
 }
 
+
+// If the saved model is not available for this key (404), look up which models the key CAN use and switch automatically.
+const SKIP_MODEL = /whisper|embed|tts|guard|audio|speech|image|vision-preview|moderation|prompt-guard|safeguard/i;
+const PREFER_MODEL = [/gpt-oss-120b/, /llama-3\.3-70b/, /llama-3\.1-70b/, /gemini-2\.5-flash$/, /llama-3\.1-8b/, /gpt-oss-20b/, /llama/, /gemini/, /./];
+async function autoModel(ai) {
+  if (ai.kind !== 'openai' || !ai.baseUrl || !ai.apiKey) return false;
+  try {
+    const r = await fetch(ai.baseUrl + '/models', { headers: { authorization: 'Bearer ' + ai.apiKey }, signal: AbortSignal.timeout(15000) });
+    if (!r.ok) return false;
+    const j = await r.json();
+    const ids = ((j.data || j.models || []).map((x) => String(x.id || x.name || '').replace(/^models\//, '')).filter((x) => x && !SKIP_MODEL.test(x) && x !== ai.model));
+    for (const re of PREFER_MODEL) {
+      const pick = ids.find((x) => re.test(x));
+      if (pick) {
+        ai.model = pick; db.settings.model = pick; saveSoon();
+        console.log('[Aura Needs] Model was not available; switched automatically to', pick);
+        return true;
+      }
+    }
+  } catch (e) { /* ignore */ }
+  return false;
+}
+
 // -------------------------------------------------------------- chat handlers
 const IMG_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 function cleanAttachments(list) {
@@ -414,9 +437,14 @@ async function handleMessage(req, res, user, chat) {
   const ping = setInterval(() => { if (!res.destroyed) res.write(': ping\n\n'); }, 15000);
 
   let acc = '';
-  try {
+  const run = async () => {
     for await (const d of streamCompletion(ai, buildHistory(chat, ai), ctrl.signal)) {
       acc += d; send({ type: 'delta', text: d });
+    }
+  };
+  try {
+    try { await run(); } catch (e) {
+      if (e instanceof AIError && e.code === 'ai_not_found' && !acc && await autoModel(ai)) await run(); else throw e;
     }
     if (!acc.trim()) throw new AIError('ai_empty', '');
   } catch (e) {
@@ -583,9 +611,9 @@ async function api(req, res, url) {
       try {
         let out = '';
         const items = [{ role: 'user', text: 'Reply with just the word: OK', images: [] }];
-        for await (const d of streamCompletion({ ...ai, maxTokens: 64, systemPrompt: 'You are a connection test.' }, items, AbortSignal.timeout(30000))) {
-          out += d; if (out.length > 80) break;
-        }
+        const t = { ...ai, maxTokens: 64, systemPrompt: 'You are a connection test.' };
+        const once = async () => { out = ''; for await (const d of streamCompletion(t, items, AbortSignal.timeout(30000))) { out += d; if (out.length > 80) break; } };
+        try { await once(); } catch (e) { if (e.code === 'ai_not_found' && await autoModel(t)) { ai.model = t.model; await once(); } else throw e; }
         return json(res, 200, { ok: true, reply: out.trim().slice(0, 80), model: ai.model });
       } catch (e) {
         return json(res, 200, { ok: false, code: e.code || 'ai_error', detail: e.detail || e.message });
